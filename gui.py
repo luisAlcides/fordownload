@@ -13,6 +13,7 @@ from download import parse_args, build_ydl_opts, download
 class Worker(QtCore.QObject):
     finished = QtCore.Signal()
     error = QtCore.Signal(str)
+    progress = QtCore.Signal(dict)
 
     def __init__(self, urls: List[str], args: object):
         super().__init__()
@@ -22,8 +23,15 @@ class Worker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            # download() expects args namespace
-            download(self._urls, self._args)
+            # download() expects args namespace; provide a callback that emits a Qt signal
+            def _cb(d):
+                # Emit the raw dict to the main thread
+                try:
+                    self.progress.emit(d)
+                except Exception:
+                    pass
+
+            download(self._urls, self._args, progress_callback=_cb)
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -34,7 +42,7 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('ForDownload')
-        self.resize(600, 200)
+        self.resize(700, 300)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -70,6 +78,17 @@ class MainWindow(QtWidgets.QWidget):
         btns.addWidget(self.start_btn)
         btns.addWidget(self.stop_btn)
         layout.addLayout(btns)
+
+        # Progress widgets
+        progress_layout = QtWidgets.QHBoxLayout()
+        self.file_label = QtWidgets.QLabel('')
+        self.file_label.setMinimumWidth(300)
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        progress_layout.addWidget(self.file_label)
+        progress_layout.addWidget(self.progress_bar)
+        layout.addLayout(progress_layout)
 
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -112,6 +131,8 @@ class MainWindow(QtWidgets.QWidget):
         self._worker_thread = QtCore.QThread()
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
+        # connect progress signal to UI updater
+        self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._worker_thread.quit)
@@ -131,9 +152,33 @@ class MainWindow(QtWidgets.QWidget):
         self.append_log('Tarea finalizada')
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.file_label.setText('')
 
     def _on_error(self, message: str):
         self.append_log('Error: ' + message)
+
+    @QtCore.Slot(dict)
+    def _on_progress(self, d: dict):
+        # d is the dict provided by yt-dlp progress hook
+        status = d.get('status')
+        if status == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            downloaded = d.get('downloaded_bytes')
+            filename = d.get('filename') or ''
+            if total and downloaded:
+                try:
+                    pct = int(downloaded / total * 100)
+                except Exception:
+                    pct = 0
+                self.progress_bar.setValue(pct)
+                self.file_label.setText(filename)
+                self.append_log(f"{filename}: {pct}%")
+        elif status == 'finished':
+            filename = d.get('filename') or ''
+            self.progress_bar.setValue(100)
+            self.file_label.setText(filename)
+            self.append_log(f"Finished: {filename}")
 
 
 def main():

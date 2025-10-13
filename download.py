@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Callable, Optional
 
 try:
     import yt_dlp
@@ -61,7 +61,7 @@ def build_ydl_opts(args: argparse.Namespace) -> Dict[str, Any]:
     return common_opts
 
 
-def download(urls: List[str], args: argparse.Namespace) -> None:
+def download(urls: List[str], args: argparse.Namespace, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
     """Download the given URLs using yt-dlp and the provided args.
 
     This performs the actual network call. It will raise if yt_dlp is not installed.
@@ -71,19 +71,26 @@ def download(urls: List[str], args: argparse.Namespace) -> None:
 
     opts = build_ydl_opts(args)
 
-    # show simple progress
-    def progress(d):
-        status = d.get('status')
-        if status == 'downloading':
-            total = d.get('total_bytes') or d.get('total_bytes_estimate')
-            downloaded = d.get('downloaded_bytes')
-            if total and downloaded:
-                pct = downloaded / total * 100
-                print(f"Downloading {d.get('filename', '')}: {pct:.1f}%", end='\r')
-        elif status == 'finished':
-            print(f"\nFinished: {d.get('filename')}")
+    # progress hook - forward to callback when provided, otherwise print to stdout
+    def _progress(d: Dict[str, Any]):
+        try:
+            if progress_callback:
+                progress_callback(d)
+                return
+            status = d.get('status')
+            if status == 'downloading':
+                total = d.get('total_bytes') or d.get('total_bytes_estimate')
+                downloaded = d.get('downloaded_bytes')
+                if total and downloaded:
+                    pct = downloaded / total * 100
+                    print(f"Downloading {d.get('filename', '')}: {pct:.1f}%", end='\r')
+            elif status == 'finished':
+                print(f"\nFinished: {d.get('filename')}")
+        except Exception:
+            # ensure progress hook never raises
+            pass
 
-    opts['progress_hooks'] = [progress]
+    opts['progress_hooks'] = [_progress]
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download(urls)
