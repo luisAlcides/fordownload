@@ -11,6 +11,37 @@ pip install -r requirements.txt
 # Asegúrate de tener ffmpeg en el PATH (https://ffmpeg.org/download.html)
 ```
 
+Uso básico (CLI):
+
+```powershell
+python download.py -f mp4 https://www.youtube.com/watch?v=xxxxxxxxxxx
+python download.py -f mp3 --quality 192 https://www.youtube.com/watch?v=xxxxxxxxxxx
+```
+
+Lanzar la GUI (PySide6):
+
+```powershell
+python -m pip install -r requirements.txt
+python gui.py
+```
+
+Notas:
+- Esta versión inicial expone un CLI y una GUI mínima que lanza descargas en un hilo de fondo.
+- Para extracción a MP3 se requiere `ffmpeg` disponible en PATH.
+- Mejoras futuras: manejo de sobrescritura, barra de progreso completa, detener descargas limpias, soporte de listas.
+# ForDownload
+
+Pequeña utilidad para descargar vídeos (MP4 hasta 1080p) y extraer audio como MP3 usando `yt-dlp` y `ffmpeg`.
+
+Instalación (Windows PowerShell):
+
+```powershell
+python -m venv env
+./env/Scripts/Activate.ps1
+pip install -r requirements.txt
+# Asegúrate de tener ffmpeg en el PATH (https://ffmpeg.org/download.html)
+```
+
 Uso básico:
 
 ```powershell
