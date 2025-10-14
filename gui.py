@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import sys
-import threading
+import re
+import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from PySide6 import QtCore, QtWidgets
-
-from download import parse_args, build_ydl_opts, download
 
 
 class Worker(QtCore.QObject):
@@ -15,23 +14,64 @@ class Worker(QtCore.QObject):
     error = QtCore.Signal(str)
     progress = QtCore.Signal(dict)
 
-    def __init__(self, urls: List[str], args: object):
+    def __init__(self, urls: List[str], output: str, fmt: str, quality: Optional[int]):
         super().__init__()
-        self._urls = urls
-        self._args = args
+        self.urls = urls
+        self.output = output
+        self.fmt = fmt
+        self.quality = int(quality) if quality else 192
+        self.proc: Optional[subprocess.Popen] = None
 
     @QtCore.Slot()
-    def run(self):
+    def run(self) -> None:
         try:
-            # download() expects args namespace; provide a callback that emits a Qt signal
-            def _cb(d):
-                # Emit the raw dict to the main thread
-                try:
-                    self.progress.emit(d)
-                except Exception:
-                    pass
+            cmd = [sys.executable, '-m', 'yt_dlp', '--newline', '--ignore-errors', '--no-playlist']
+            outtmpl = str(Path(self.output) / '%(title)s.%(ext)s')
+            cmd += ['-o', outtmpl]
+            if self.fmt == 'mp4':
+                fmt_expr = (
+                    'bestvideo[ext=mp4][height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]'
+                    '/bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+                )
+                cmd += ['-f', fmt_expr, '--merge-output-format', 'mp4']
+            elif self.fmt == 'mp3':
+                cmd += ['-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', f'{self.quality}K']
+            else:
+                cmd += ['-f', 'best']
+            cmd += self.urls
 
-            download(self._urls, self._args, progress_callback=_cb)
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+
+            current_file = ''
+            dest_re = re.compile(r"\[download\]\s+Destination:\s+(.*)")
+            prog_re = re.compile(r"\[download\]\s+(\d{1,3}(?:\.\d)?)%")
+
+            assert self.proc.stdout is not None
+            for line in self.proc.stdout:
+                line = line.rstrip('\n')
+                m_dest = dest_re.search(line)
+                if m_dest:
+                    current_file = m_dest.group(1)
+                m = prog_re.search(line)
+                if m:
+                    try:
+                        percent = int(float(m.group(1)))
+                    except Exception:
+                        percent = 0
+                    self.progress.emit({'status': 'downloading', 'filename': current_file, 'percent': percent})
+
+            ret = self.proc.wait()
+            if ret == 0:
+                self.progress.emit({'status': 'finished', 'filename': current_file})
+            else:
+                raise RuntimeError(f'yt-dlp exited with code {ret}')
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -39,10 +79,10 @@ class Worker(QtCore.QObject):
 
 
 class MainWindow(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle('ForDownload')
-        self.resize(700, 300)
+        self.resize(720, 340)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -68,21 +108,18 @@ class MainWindow(QtWidgets.QWidget):
         form.addWidget(QtWidgets.QLabel('Output:'))
         form.addWidget(self.output_edit)
         form.addWidget(out_btn)
-
         layout.addLayout(form)
 
         btns = QtWidgets.QHBoxLayout()
         self.start_btn = QtWidgets.QPushButton('Iniciar')
-        self.stop_btn = QtWidgets.QPushButton('Detener')
-        self.stop_btn.setEnabled(False)
+        self.clear_btn = QtWidgets.QPushButton('Limpiar')
         btns.addWidget(self.start_btn)
-        btns.addWidget(self.stop_btn)
+        btns.addWidget(self.clear_btn)
         layout.addLayout(btns)
 
-        # Progress widgets
         progress_layout = QtWidgets.QHBoxLayout()
         self.file_label = QtWidgets.QLabel('')
-        self.file_label.setMinimumWidth(300)
+        self.file_label.setMinimumWidth(320)
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -95,93 +132,82 @@ class MainWindow(QtWidgets.QWidget):
         layout.addWidget(self.log)
 
         self.start_btn.clicked.connect(self.start)
-        self.stop_btn.clicked.connect(self.stop)
+        self.clear_btn.clicked.connect(self.clear_ui)
 
-        self._thread = None
-        self._worker = None
+        self.worker: Optional[Worker] = None
+        self.worker_thread: Optional[QtCore.QThread] = None
 
-    def choose_output(self):
+    def choose_output(self) -> None:
         dirpath = QtWidgets.QFileDialog.getExistingDirectory(self, 'Seleccionar directorio', str(Path.cwd()))
         if dirpath:
             self.output_edit.setText(dirpath)
 
-    def append_log(self, text: str):
+    def append_log(self, text: str) -> None:
         self.log.appendPlainText(text)
 
-    def start(self):
+    def start(self) -> None:
         raw = self.url_edit.toPlainText().strip()
         if not raw:
             self.append_log('No hay URLs')
             return
         urls = [line.strip() for line in raw.splitlines() if line.strip()]
 
-        # build args namespace similar to CLI
-        class Args:
-            pass
+        output_dir = self.output_edit.text()
+        try:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.append_log(f'No se pudo crear el directorio: {e}')
+            return
 
-        args = Args()
-        args.output = self.output_edit.text()
-        args.format = self.format_combo.currentText()
-        args.quality = self.quality_spin.value()
-        args.playlist = False
-        args.overwrite = False
+        fmt = self.format_combo.currentText()
+        quality = int(self.quality_spin.value()) if fmt == 'mp3' else None
 
-        # run in background thread
-        self._worker = Worker(urls, args)
-        self._worker_thread = QtCore.QThread()
-        self._worker.moveToThread(self._worker_thread)
-        self._worker_thread.started.connect(self._worker.run)
-        # connect progress signal to UI updater
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-        self._worker.finished.connect(self._worker_thread.quit)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self.worker = Worker(urls, output_dir, fmt, quality)
+        self.worker_thread = QtCore.QThread()
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.error.connect(self._on_error)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
 
         self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
         self.append_log('Iniciando descarga...')
-        self._worker_thread.start()
+        self.worker_thread.start()
 
-    def stop(self):
-        # there is no clean stop implemented for yt-dlp in this simple GUI.
-        self.append_log('Detener no implementado en esta versión')
-
-    def _on_finished(self):
+    def _on_finished(self) -> None:
         self.append_log('Tarea finalizada')
         self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
         self.progress_bar.setValue(0)
         self.file_label.setText('')
 
-    def _on_error(self, message: str):
+    def _on_error(self, message: str) -> None:
         self.append_log('Error: ' + message)
 
     @QtCore.Slot(dict)
-    def _on_progress(self, d: dict):
-        # d is the dict provided by yt-dlp progress hook
+    def _on_progress(self, d: dict) -> None:
         status = d.get('status')
         if status == 'downloading':
-            total = d.get('total_bytes') or d.get('total_bytes_estimate')
-            downloaded = d.get('downloaded_bytes')
             filename = d.get('filename') or ''
-            if total and downloaded:
-                try:
-                    pct = int(downloaded / total * 100)
-                except Exception:
-                    pct = 0
-                self.progress_bar.setValue(pct)
-                self.file_label.setText(filename)
-                self.append_log(f"{filename}: {pct}%")
+            pct = int(d.get('percent') or 0)
+            self.progress_bar.setValue(pct)
+            self.file_label.setText(filename)
+            self.append_log(f'{filename}: {pct}%')
         elif status == 'finished':
             filename = d.get('filename') or ''
             self.progress_bar.setValue(100)
             self.file_label.setText(filename)
-            self.append_log(f"Finished: {filename}")
+            self.append_log(f'Finished: {filename}')
+
+    def clear_ui(self) -> None:
+        self.log.clear()
+        self.progress_bar.setValue(0)
+        self.file_label.setText('')
 
 
-def main():
+def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     w = MainWindow()
     w.show()

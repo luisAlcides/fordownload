@@ -35,9 +35,15 @@ def build_ydl_opts(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
     if args.format == 'mp4':
-        # Prefer best video up to 1080p + best audio, fallback to best
-        common_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
-        # Ensure postprocessors will mux if necessary (yt-dlp does this automatically when merging)
+        # Prefer H.264/MP4 video up to 1080p + matching audio (will produce MP4 when possible).
+        # Fallback to the best video+audio (may be webm/VP9) if H.264 isn't available at that resolution.
+        # Note: remuxing VP9/AV1 into MP4 isn't supported; converting them to MP4 requires re-encoding.
+        common_opts['format'] = (
+            'bestvideo[ext=mp4][height<=1080][vcodec~="avc1|h264"]+bestaudio[ext=m4a]'
+            '/bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+        )
+        # Ask yt-dlp to merge/remux output into an MP4 container when possible
+        common_opts['merge_output_format'] = 'mp4'
     elif args.format == 'mp3':
         common_opts['format'] = 'bestaudio/best'
         common_opts['postprocessors'] = [
@@ -73,10 +79,11 @@ def download(urls: List[str], args: argparse.Namespace, progress_callback: Optio
 
     # progress hook - forward to callback when provided, otherwise print to stdout
     def _progress(d: Dict[str, Any]):
+        # If a callback is provided (e.g., GUI), let exceptions propagate to abort download
+        if progress_callback:
+            progress_callback(d)
+            return
         try:
-            if progress_callback:
-                progress_callback(d)
-                return
             status = d.get('status')
             if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate')
@@ -87,7 +94,7 @@ def download(urls: List[str], args: argparse.Namespace, progress_callback: Optio
             elif status == 'finished':
                 print(f"\nFinished: {d.get('filename')}")
         except Exception:
-            # ensure progress hook never raises
+            # ensure progress hook never raises during CLI mode
             pass
 
     opts['progress_hooks'] = [_progress]
