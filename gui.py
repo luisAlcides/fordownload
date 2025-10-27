@@ -3,10 +3,12 @@ from __future__ import annotations
 import sys
 import re
 import subprocess
+import argparse
 from pathlib import Path
 from typing import List, Optional
 
 from PySide6 import QtCore, QtWidgets
+from download import download
 
 
 class Worker(QtCore.QObject):
@@ -14,64 +16,49 @@ class Worker(QtCore.QObject):
     error = QtCore.Signal(str)
     progress = QtCore.Signal(dict)
 
-    def __init__(self, urls: List[str], output: str, fmt: str, quality: Optional[int]):
+    def __init__(self, urls: List[str], output: str, fmt: str, quality: Optional[int], playlist: bool = False):
         super().__init__()
         self.urls = urls
         self.output = output
         self.fmt = fmt
         self.quality = int(quality) if quality else 192
+        self.playlist = bool(playlist)
         self.proc: Optional[subprocess.Popen] = None
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            cmd = [sys.executable, '-m', 'yt_dlp', '--newline', '--ignore-errors', '--no-playlist']
-            outtmpl = str(Path(self.output) / '%(title)s.%(ext)s')
-            cmd += ['-o', outtmpl]
-            if self.fmt == 'mp4':
-                fmt_expr = (
-                    'bestvideo[ext=mp4][height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]'
-                    '/bestvideo[height<=1080]+bestaudio/best[height<=1080]'
-                )
-                cmd += ['-f', fmt_expr, '--merge-output-format', 'mp4']
-            elif self.fmt == 'mp3':
-                cmd += ['-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', f'{self.quality}K']
-            else:
-                cmd += ['-f', 'best']
-            cmd += self.urls
+            # progress callback to translate yt-dlp progress dicts into signals
+            def progress_cb(d: dict) -> None:
+                try:
+                    status = d.get('status')
+                    if status == 'downloading':
+                        total = d.get('total_bytes') or d.get('total_bytes_estimate')
+                        downloaded = d.get('downloaded_bytes') or d.get('downloaded_bytes_estimate')
+                        try:
+                            percent = int(downloaded / total * 100) if total and downloaded else 0
+                        except Exception:
+                            percent = 0
+                        filename = d.get('filename') or ''
+                        self.progress.emit({'status': 'downloading', 'filename': filename, 'percent': percent})
+                    elif status == 'finished':
+                        filename = d.get('filename') or ''
+                        self.progress.emit({'status': 'finished', 'filename': filename})
+                except Exception:
+                    # ensure callback never raises into download
+                    pass
 
-            self.proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
+            # Build a minimal argparse.Namespace compatible with download.build_ydl_opts
+            args = argparse.Namespace(
+                output=self.output,
+                format=self.fmt,
+                quality=self.quality,
+                playlist=self.playlist,
+                overwrite=False,
             )
 
-            current_file = ''
-            dest_re = re.compile(r"\[download\]\s+Destination:\s+(.*)")
-            prog_re = re.compile(r"\[download\]\s+(\d{1,3}(?:\.\d)?)%")
-
-            assert self.proc.stdout is not None
-            for line in self.proc.stdout:
-                line = line.rstrip('\n')
-                m_dest = dest_re.search(line)
-                if m_dest:
-                    current_file = m_dest.group(1)
-                m = prog_re.search(line)
-                if m:
-                    try:
-                        percent = int(float(m.group(1)))
-                    except Exception:
-                        percent = 0
-                    self.progress.emit({'status': 'downloading', 'filename': current_file, 'percent': percent})
-
-            ret = self.proc.wait()
-            if ret == 0:
-                self.progress.emit({'status': 'finished', 'filename': current_file})
-            else:
-                raise RuntimeError(f'yt-dlp exited with code {ret}')
+            # Call the shared download logic from download.py (runs in this thread)
+            download(self.urls, args, progress_callback=progress_cb)
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -101,6 +88,10 @@ class MainWindow(QtWidgets.QWidget):
         self.quality_spin.setValue(192)
         form.addWidget(QtWidgets.QLabel('Quality (kbps):'))
         form.addWidget(self.quality_spin)
+
+        # Playlist checkbox: when checked, treat entered URLs as playlist(s)
+        self.playlist_chk = QtWidgets.QCheckBox('Playlist')
+        form.addWidget(self.playlist_chk)
 
         self.output_edit = QtWidgets.QLineEdit(str(Path.cwd()))
         out_btn = QtWidgets.QPushButton('...')
@@ -162,7 +153,8 @@ class MainWindow(QtWidgets.QWidget):
         fmt = self.format_combo.currentText()
         quality = int(self.quality_spin.value()) if fmt == 'mp3' else None
 
-        self.worker = Worker(urls, output_dir, fmt, quality)
+        playlist = bool(self.playlist_chk.isChecked()) if hasattr(self, 'playlist_chk') else False
+        self.worker = Worker(urls, output_dir, fmt, quality, playlist)
         self.worker_thread = QtCore.QThread()
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
